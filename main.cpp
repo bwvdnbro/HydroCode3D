@@ -16,8 +16,21 @@
  * along with HydroCode3D. If not, see <http://www.gnu.org/licenses/>.
  ******************************************************************************/
 
+/**
+ * @file main.cpp
+ *
+ * @brief 3D hydro solver.
+ *
+ * For clarity, each function indicates the SI quantity represented by the input
+ * and output variables. The only relevant SI quantities in this code are length
+ * ([L]), time ([T]), and mass ([M]).
+ *
+ * @author Bert Vandenbroucke (bv7@st-andrews.ac.uk)
+ */
+
 #include "RiemannSolver.hpp"
 #include "Timer.hpp"
+
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -25,12 +38,79 @@
 #include <sstream>
 #include <vector>
 
-//#define XMIN (-200.)
-//#define XMAX 200.
-//#define YMIN (-200.)
-//#define YMAX 200.
-//#define ZMIN (-200.)
-//#define ZMAX 200.
+/// parameter definitions
+
+// supported problem setups
+#define PROBLEM_SOD_SHOCK 0
+#define PROBLEM_DISC_PATCH 1
+
+// supported boundary condition types
+#define BOUNDARIES_PERIODIC 0
+#define BOUNDARIES_OPEN 1
+#define BOUNDARIES_REFLECTIVE 2
+
+// supported equations of state
+#define EOS_IDEAL 0
+#define EOS_ISOTHERMAL 1
+
+// supported external potentials
+#define POTENTIAL_NONE 0
+#define POTENTIAL_DISC 1
+
+/// customizable parameters
+
+// problem we want to solve
+#define PROBLEM PROBLEM_SOD_SHOCK
+
+// number of cells in each spatial dimension
+#define NCELL_X 100
+#define NCELL_Y 10
+#define NCELL_Z 10
+
+// adiabatic index
+#define GAMMA (5. / 3.)
+
+// slope limiter constant (1/2 is the most conservative value, larger values are
+// more accurate but less stable)
+#define BETA 0.5
+
+// type of boundary conditions to use in each dimension
+#define BOUNDARIES_X BOUNDARIES_PERIODIC
+#define BOUNDARIES_Y BOUNDARIES_PERIODIC
+#define BOUNDARIES_Z BOUNDARIES_PERIODIC
+
+// equation of state to use
+#define EOS EOS_ISOTHERMAL
+
+// isothermal thermal energy (if EOS_ISOTHERMAL is selected)
+#define ISOTHERMAL_U 20.26785
+
+// value for the gravitational constant G (if a potential is used)
+#define G 4.30097e-03
+
+/// end of customizable parameters
+
+// sanity checks
+#ifndef PROBLEM
+#error "No problem selected!"
+#endif
+
+#ifndef BOUNDARIES_X
+#error "No boundary condition chosen in the x direction!"
+#endif
+#ifndef BOUNDARIES_Y
+#error "No boundary condition chosen in the y direction!"
+#endif
+#ifndef BOUNDARIES_Z
+#error "No boundary condition chosen in the z direction!"
+#endif
+
+#ifndef EOS
+#error "No equation of state chosen!"
+#endif
+
+#if PROBLEM == PROBLEM_SOD_SHOCK
+/// sod shock setup <<<
 #define XMIN 0.
 #define XMAX 1.
 #define YMIN 0.
@@ -38,47 +118,37 @@
 #define ZMIN 0.
 #define ZMAX 1.
 
-#define NCELL_X 100
-#define NCELL_Y 10
-#define NCELL_Z 10
-#define GAMMA (5. / 3.)
 #define DT 0.001
 #define NSTEP 100
 #define SNAPSTEP 10
-
-#define BETA 0.5
-
-#define BOUNDARIES_PERIODIC 0
-#define BOUNDARIES_OPEN 1
-#define BOUNDARIES_REFLECTIVE 2
-#define BOUNDARIES_DISC_PATCH 3
-#define BOUNDARIES_DISC_PATCH_SUP 4
-
-#define BOUNDARIES BOUNDARIES_PERIODIC
-
-#define EOS_IDEAL 0
-#define EOS_ISOTHERMAL 1
-
-#define EOS EOS_ISOTHERMAL
-
-#define ISOTHERMAL_U 20.26785
-
-#define POTENTIAL_NONE 0
-#define POTENTIAL_DISC 1
-#define POTENTIAL_DISC_SUP 2
+#define SNAP_PREFIX "sod_"
 
 #define POTENTIAL POTENTIAL_NONE
+/// >>>
+#elif PROBLEM == PROBLEM_DISC_PATCH
+/// disc patch setup <<<
+#define XMIN (-200.)
+#define XMAX 200.
+#define YMIN (-200.)
+#define YMAX 200.
+#define ZMIN (-200.)
+#define ZMAX 200.
 
-#define G 4.30097e-03
+#define DT 0.01
+#define NSTEP 1000000
+#define SNAPSTEP 10000
+#define SNAP_PREFIX "disc_"
 
-#define DISC_SUP_GROWTH_TIME 1000.
+#define POTENTIAL POTENTIAL_DISC
+/// >>>
+#else
+#error "Unknown problem chosen!"
+#endif
 
-/// end of customizable parameters
-
+/// precomputed geometrical variables
 #define BOXSIZE_X (XMAX - XMIN)
 #define BOXSIZE_Y (YMAX - YMIN)
 #define BOXSIZE_Z (ZMAX - ZMIN)
-#define ISOTHERMAL_C (ISOTHERMAL_U * (GAMMA - 1.))
 #define CELLSIZE_X (BOXSIZE_X / NCELL_X)
 #define CELLSIZE_Y (BOXSIZE_Y / NCELL_Y)
 #define CELLSIZE_Z (BOXSIZE_Z / NCELL_Z)
@@ -90,43 +160,371 @@
 #define CELL_AREA_X (CELLSIZE_Y * CELLSIZE_Z)
 #define CELL_AREA_Y (CELLSIZE_X * CELLSIZE_Z)
 #define CELL_AREA_Z (CELLSIZE_X * CELLSIZE_Y)
+
 #define DT_CELL_AREA_X (DT * CELL_AREA_X)
 #define DT_CELL_AREA_Y (DT * CELL_AREA_Y)
 #define DT_CELL_AREA_Z (DT * CELL_AREA_Z)
 
+// isothermal soundspeed (if EOS_ISOTHERMAL is chosen)
+#define ISOTHERMAL_C (ISOTHERMAL_U * (GAMMA - 1.))
+
+// precomputed quantities involving the adiabatic index
+#define GAMMA_MINUS_ONE (GAMMA - 1.)
+#define ONE_OVER_GAMMA_MINUS_ONE (1. / (GAMMA - 1.))
+
+/**
+ * @brief Get the pressure for the given total energy, density and velocity.
+ *
+ * @param E Total energy ([M] [L]^2 [T]^-2).
+ * @param rho Density ([M] [L]^-3).
+ * @param u Velocity (vector, [M] [T]^-1).
+ * @return Pressure ([M] [L]^-1 [T]^-2).
+ */
+#if EOS == EOS_IDEAL
+#define get_pressure(E, rho, u)                                                \
+  GAMMA_MINUS_ONE *(E * CELL_VOLUME_INV -                                      \
+                    0.5 * rho * (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]))
+#elif EOS == EOS_ISOTHERMAL
+#define get_pressure(E, rho, u) ISOTHERMAL_C *rho;
+#else
+#error "No equation of state selected!"
+#endif
+
+/**
+ * @brief Compute the primitive variables for the given values of the conserved
+ * variables.
+ *
+ * @param rho Density value to compute ([M] [L]^-3).
+ * @param u Velocity value to compute (vector, [M] [T]^-1).
+ * @param P Pressure value to compute ([M] [L]^-1 [T]^-2).
+ * @param m Mass value ([M]).
+ * @param p Momentum value (vector, [M] [L] [T]^-1).
+ * @param E Energy value ([M] [L]^2 [T]^-2).
+ */
+#define compute_primitive_variables(rho, u, P, m, p, E)                        \
+  rho = m * CELL_VOLUME_INV;                                                   \
+  const double minv = 1. / m;                                                  \
+  u[0] = p[0] * minv;                                                          \
+  u[1] = p[1] * minv;                                                          \
+  u[2] = p[2] * minv;                                                          \
+  P = get_pressure(E, rho, u);
+
+/**
+ * @brief Copy the primitive variables from the given cell to the given other
+ * cell.
+ *
+ * @param from Cell to copy from.
+ * @param to Cell to copy to.
+ */
+#define copy_primitives(from, to)                                              \
+  to._rho = from._rho;                                                         \
+  to._u[0] = from._u[0];                                                       \
+  to._u[1] = from._u[1];                                                       \
+  to._u[2] = from._u[2];                                                       \
+  to._P = from._P;
+
+/**
+ * @brief Compute the gradient for the given quantity, based on the given value
+ * of the quantity in the cell and the neighbouring cells.
+ *
+ * The quantity is expressed in units [Q].
+ *
+ * @param grad_phi Gradient to compute ([Q] [L]^-1).
+ * @param phi Value of the quantity in the cell ([Q]).
+ * @param phi_left Value of the quantity in the neighbouring cell with a smaller
+ * x coordinate ([Q]).
+ * @param phi_right Value of the quantity in the neighbouring cell with a larger
+ * x coordinate ([Q]).
+ * @param phi_front Value of the quantity in the neighbouring cell with a
+ * smaller y coordinate ([Q]).
+ * @param phi_back Value of the quantity in the neighbouring cell with a larger
+ * y coordinate ([Q]).
+ * @param phi_bottom Value of the quantity in the neighbouring cell with a
+ * smaller z coordinate ([Q]).
+ * @param phi_top Value of the quantity in the neighbouring cell with a larger
+ * z coordinate ([Q]).
+ */
+#define compute_gradient(grad_phi, phi, phi_left, phi_right, phi_front,        \
+                         phi_back, phi_bottom, phi_top)                        \
+  {                                                                            \
+    grad_phi[0] = 0.5 * CELLSIZE_X_INV * (phi_right - phi_left);               \
+    grad_phi[1] = 0.5 * CELLSIZE_Y_INV * (phi_back - phi_front);               \
+    grad_phi[2] = 0.5 * CELLSIZE_Z_INV * (phi_top - phi_bottom);               \
+                                                                               \
+    /* Apply a cell wide slope limiter (Hopkins, 2015) */                      \
+    double alpha, phi_ngb_max, phi_ext_max, phi_ngb_min, phi_ext_min;          \
+    phi_ngb_max = std::max(phi_left, phi_right);                               \
+    phi_ngb_max = std::max(phi_ngb_max, phi_front);                            \
+    phi_ngb_max = std::max(phi_ngb_max, phi_back);                             \
+    phi_ngb_max = std::max(phi_ngb_max, phi_bottom);                           \
+    phi_ngb_max = std::max(phi_ngb_max, phi_top);                              \
+    phi_ngb_max -= phi;                                                        \
+    phi_ngb_min = std::min(phi_left, phi_right);                               \
+    phi_ngb_min = std::min(phi_ngb_min, phi_front);                            \
+    phi_ngb_min = std::min(phi_ngb_min, phi_back);                             \
+    phi_ngb_min = std::min(phi_ngb_min, phi_bottom);                           \
+    phi_ngb_min = std::min(phi_ngb_min, phi_top);                              \
+    phi_ngb_min -= phi;                                                        \
+    phi_ext_max = 0.5 * CELLSIZE_X * std::max(grad_phi[0], -grad_phi[0]);      \
+    phi_ext_max = std::max(phi_ext_max, 0.5 * CELLSIZE_Y * grad_phi[1]);       \
+    phi_ext_max = std::max(phi_ext_max, -0.5 * CELLSIZE_Y * grad_phi[1]);      \
+    phi_ext_max = std::max(phi_ext_max, 0.5 * CELLSIZE_Z * grad_phi[2]);       \
+    phi_ext_max = std::max(phi_ext_max, -0.5 * CELLSIZE_Z * grad_phi[2]);      \
+    phi_ext_min = 0.5 * CELLSIZE_X * std::min(grad_phi[0], -grad_phi[0]);      \
+    phi_ext_min = std::min(phi_ext_min, 0.5 * CELLSIZE_Y * grad_phi[1]);       \
+    phi_ext_min = std::min(phi_ext_min, -0.5 * CELLSIZE_Y * grad_phi[1]);      \
+    phi_ext_min = std::min(phi_ext_min, 0.5 * CELLSIZE_Z * grad_phi[2]);       \
+    phi_ext_min = std::min(phi_ext_min, -0.5 * CELLSIZE_Z * grad_phi[2]);      \
+                                                                               \
+    alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,            \
+                                         phi_ngb_min / phi_ext_min));          \
+    grad_phi[0] *= alpha;                                                      \
+    grad_phi[1] *= alpha;                                                      \
+    grad_phi[2] *= alpha;                                                      \
+  }
+
+/**
+ * @brief Copy the gradients from the given cell into the other given cell.
+ *
+ * @param from Cell to copy from.
+ * @param to Cell to copy to.
+ */
+#define copy_gradients(from, to)                                               \
+  to._grad_rho[0] = from._grad_rho[0];                                         \
+  to._grad_rho[1] = from._grad_rho[1];                                         \
+  to._grad_rho[2] = from._grad_rho[2];                                         \
+  to._grad_u[0][0] = from._grad_u[0][0];                                       \
+  to._grad_u[0][1] = from._grad_u[0][1];                                       \
+  to._grad_u[0][2] = from._grad_u[0][2];                                       \
+  to._grad_u[1][0] = from._grad_u[1][0];                                       \
+  to._grad_u[1][1] = from._grad_u[1][1];                                       \
+  to._grad_u[1][2] = from._grad_u[1][2];                                       \
+  to._grad_u[2][0] = from._grad_u[2][0];                                       \
+  to._grad_u[2][1] = from._grad_u[2][1];                                       \
+  to._grad_u[2][2] = from._grad_u[2][2];                                       \
+  to._grad_P[0] = from._grad_P[0];                                             \
+  to._grad_P[1] = from._grad_P[1];                                             \
+  to._grad_P[2] = from._grad_P[2];
+
+/**
+ * @brief Predict the given primitive variables forward in time for half a
+ * timestep, based on the given gradients.
+ *
+ * @param rho Density value to update ([M] [L]^-3).
+ * @param u Velocity value to update (vector, [L] [T]^-1).
+ * @param P Pressure value to update ([M] [L]^-1 [T]^-2).
+ * @param grad_rho Gradient of the density to use (vector, [M] [L]^-4).
+ * @param grad_u Gradient of the velocity to use (tensor, [T]^-1).
+ * @param grad_P Gradient of the pressure to use (vector, [M] [L]^-2 [T]^-2).
+ */
+#define do_half_step_prediction(rho, u, P, grad_rho, grad_u, grad_P)           \
+  const double old_rho = rho;                                                  \
+  const double old_u[3] = {u[0], u[1], u[2]};                                  \
+  const double old_P = P;                                                      \
+                                                                               \
+  const double rho_inv = 1. / rho;                                             \
+  const double div_u = grad_u[0][0] + grad_u[1][1] + grad_u[2][2];             \
+                                                                               \
+  rho -= 0.5 * DT * (old_rho * div_u + old_u[0] * grad_rho[0] +                \
+                     old_u[1] * grad_rho[1] + old_u[2] * grad_rho[2]);         \
+  u[0] -= 0.5 * DT * (old_u[0] * div_u + rho_inv * grad_P[0]);                 \
+  u[1] -= 0.5 * DT * (old_u[1] * div_u + rho_inv * grad_P[1]);                 \
+  u[2] -= 0.5 * DT * (old_u[2] * div_u + rho_inv * grad_P[2]);                 \
+  P -= 0.5 * DT * (GAMMA * old_P * div_u + old_u[0] * grad_P[0] +              \
+                   old_u[1] * grad_P[1] + old_u[2] * grad_P[2]);
+
+/**
+ * @brief Extrapolate the given quantity forward in time using the given
+ * gradient, distance, and direction.
+ *
+ * The quantity is expressed in units [Q].
+ *
+ * @param phi Quantity to extrapolate ([Q]).
+ * @param grad_phi Gradient of the quantity (vector, [Q] [L]^-1).
+ * @param ds Distance over which we extrapolate ([L]).
+ * @param direction Extrapolation direction (0 / 1 / 2).
+ * @return Extrapolated quantity.
+ */
+#define extrapolate_quantity(phi, grad_phi, ds, direction)                     \
+  phi + ds *grad_phi[direction]
+
+/**
+ * @brief Solve the 3D Riemann problem with the given left and right state, in
+ * the given direction.
+ *
+ * @param rhoL Left state density ([M] [L]^-3).
+ * @param uL Left state velocity (vector, [L] [T]^-1).
+ * @param PL Left state pressure ([M] [L]^-1 [T]^-2).
+ * @param rhoR Right state density ([M] [L]^-3).
+ * @param uR Right state velocity (vector, [L] [T]^-1).
+ * @param PR Right state pressure ([M] [L]^-1 [T]^-2).
+ * @param rhosol Solution density to compute ([M] [L]^-3).
+ * @param usol Solution velocity to compute (vector, [L] [T]^-1).
+ * @param Psol Solution pressure to compute ([M] [L]^-1 [T]^-2).
+ * @param direction Direction in which we solve the problem (0 / 1 / 2).
+ */
+#define solve_3d_riemann_problem(rhoL, uL, PL, rhoR, uR, PR, rhosol, usol,     \
+                                 Psol, direction)                              \
+  {                                                                            \
+    const int flag =                                                           \
+        solver.solve(rhoL, uL[direction], PL, rhoR, uR[direction], PR, rhosol, \
+                     usol[direction], Psol);                                   \
+    if (flag < 0) {                                                            \
+      usol[(direction + 1) % 3] = uL[(direction + 1) % 3];                     \
+      usol[(direction + 2) % 3] = uL[(direction + 2) % 3];                     \
+    } else {                                                                   \
+      usol[(direction + 1) % 3] = uR[(direction + 1) % 3];                     \
+      usol[(direction + 2) % 3] = uR[(direction + 2) % 3];                     \
+    }                                                                          \
+  }
+
+/**
+ * @brief Get the fluxes between the given left and right state.
+ *
+ * @param mflux Mass flux to compute ([M] [L]^-2 [T]^-1).
+ * @param pflux Momentum flux to compute ([M] [L]^-1 [T]^-2).
+ * @param Eflux Energy flux to compute ([M] [T]^-3).
+ * @param rhoL Left state density ([M] [L]^-3).
+ * @param uL Left state velocity (vector, [L] [T]^-1).
+ * @param PL Left state pressure ([M] [L]^-1 [T]^-2).
+ * @param rhoR Right state density ([M] [L]^-3).
+ * @param uR Right state velocity (vector, [L] [T]^-1).
+ * @param PR Right state pressure ([M] [L]^-1 [T]^-2).
+ * @param grad_rhoL Left state density gradient (vector, [M] [L]^-4).
+ * @param grad_uL Left state velocity gradient (tensor, [T]^-1).
+ * @param grad_PL Left state pressure gradient (vector, [M] [L]^-2 [T]^-2).
+ * @param grad_rhoR Right state density gradient (vector, [M] [L]^-4).
+ * @param grad_uR Right state velocity gradient (tensor, [T]^-1).
+ * @param grad_PR Right state pressure gradient (vector, [M] [L]^-2 [T]^-2).
+ * @param ds Distance over which the states are extrapolated in space ([L]).
+ * @param direction Direction of the fluxes (0 / 1 / 2).
+ */
+#define get_fluxes(mflux, pflux, Eflux, rhoL, uL, PL, rhoR, uR, PR, grad_rhoL, \
+                   grad_uL, grad_PL, grad_rhoR, grad_uR, grad_PR, ds,          \
+                   direction)                                                  \
+  {                                                                            \
+    const double rhoL_dash =                                                   \
+        extrapolate_quantity(rhoL, grad_rhoL, ds, direction);                  \
+    const double uL_dash[3] = {                                                \
+        extrapolate_quantity(uL[0], grad_uL[0], ds, direction),                \
+        extrapolate_quantity(uL[1], grad_uL[1], ds, direction),                \
+        extrapolate_quantity(uL[2], grad_uL[2], ds, direction)};               \
+    const double PL_dash = extrapolate_quantity(PL, grad_PL, ds, direction);   \
+    const double rhoR_dash =                                                   \
+        extrapolate_quantity(rhoR, grad_rhoR, -ds, direction);                 \
+    const double uR_dash[3] = {                                                \
+        extrapolate_quantity(uR[0], grad_uR[0], -ds, direction),               \
+        extrapolate_quantity(uR[1], grad_uR[1], -ds, direction),               \
+        extrapolate_quantity(uR[2], grad_uR[2], -ds, direction)};              \
+    const double PR_dash = extrapolate_quantity(PR, grad_PR, -ds, direction);  \
+                                                                               \
+    double rhosol, usol[3], Psol;                                              \
+    solve_3d_riemann_problem(rhoL_dash, uL_dash, PL_dash, rhoR_dash, uR_dash,  \
+                             PR_dash, rhosol, usol, Psol, direction);          \
+                                                                               \
+    mflux = rhosol * usol[direction];                                          \
+    pflux[0] = rhosol * usol[0] * usol[direction];                             \
+    pflux[1] = rhosol * usol[1] * usol[direction];                             \
+    pflux[2] = rhosol * usol[2] * usol[direction];                             \
+    pflux[direction] += Psol;                                                  \
+    Eflux = (Psol * ONE_OVER_GAMMA_MINUS_ONE +                                 \
+             0.5 * rhosol * (usol[0] * usol[0] + usol[1] * usol[1] +           \
+                             usol[2] * usol[2])) *                             \
+                usol[direction] +                                              \
+            Psol * usol[direction];                                            \
+  }
+
+/**
+ * @brief Do the flux exchange assuming the active cell has a lower coordinate
+ * in the given direction than the neighbouring cell.
+ *
+ * @param lcell Active cell.
+ * @param rcell Neighbouring cell.
+ * @param ds Distance between the midpoint of the active cell and the midpoint
+ * of the face between the active cell and its neighbour ([L]).
+ * @param Adt Surface area of the face times the system time step ([L]^2 [T]).
+ * @param direction Direction of the face (0 / 1 / 2).
+ */
+#define do_flux_exchange_left(lcell, rcell, ds, Adt, direction)                \
+  {                                                                            \
+    double mflux, pflux[3], Eflux;                                             \
+    get_fluxes(mflux, pflux, Eflux, lcell._rho, lcell._u, lcell._P,            \
+               rcell._rho, rcell._u, rcell._P, lcell._grad_rho, lcell._grad_u, \
+               lcell._grad_P, rcell._grad_rho, rcell._grad_u, rcell._grad_P,   \
+               ds, direction);                                                 \
+    lcell._m -= Adt * mflux;                                                   \
+    lcell._p[0] -= Adt * pflux[0];                                             \
+    lcell._p[1] -= Adt * pflux[1];                                             \
+    lcell._p[2] -= Adt * pflux[2];                                             \
+    lcell._E -= Adt * Eflux;                                                   \
+  }
+
+/**
+ * @brief Do the flux exchange assuming the active cell has a higher coordinate
+ * in the given direction than the neighbouring cell.
+ *
+ * @param lcell Active cell.
+ * @param rcell Neighbouring cell.
+ * @param ds Distance between the midpoint of the active cell and the midpoint
+ * of the face between the active cell and its neighbour ([L]).
+ * @param Adt Surface area of the face times the system time step ([L]^2 [T]).
+ * @param direction Direction of the face (0 / 1 / 2).
+ */
+#define do_flux_exchange_right(lcell, rcell, ds, Adt, direction)               \
+  {                                                                            \
+    double mflux, pflux[3], Eflux;                                             \
+    get_fluxes(mflux, pflux, Eflux, rcell._rho, rcell._u, rcell._P,            \
+               lcell._rho, lcell._u, lcell._P, rcell._grad_rho, rcell._grad_u, \
+               rcell._grad_P, lcell._grad_rho, lcell._grad_u, lcell._grad_P,   \
+               ds, direction);                                                 \
+    lcell._m += Adt * mflux;                                                   \
+    lcell._p[0] += Adt * pflux[0];                                             \
+    lcell._p[1] += Adt * pflux[1];                                             \
+    lcell._p[2] += Adt * pflux[2];                                             \
+    lcell._E += Adt * Eflux;                                                   \
+  }
+
+/**
+ * @brief Cell.
+ */
 class Cell {
 public:
+  /*! @brief Density ([M] [L]^-3). */
   double _rho;
+  /*! @brief Velocity (vector, [L] [T]^-1). */
   double _u[3];
+  /*! @brief Pressure ([M] [L]^-1 [T]^-2). */
   double _P;
 
+  /*! @brief Density gradient (vector, [M] [L]^-4). */
   double _grad_rho[3];
+  /*! @brief Velocity gradient (tensor, [T]^-1). */
   double _grad_u[3][3];
+  /*! @brief Pressure gradient (vector, [M] [L]^-2 [T]^-2). */
   double _grad_P[3];
 
+  /*! @brief Mass ([M]). */
   double _m;
+  /*! @brief Momentum ([M] [L] [T]^-1). */
   double _p[3];
+  /*! @brief Total energy ([M] [L]^2 [T]^-2). */
   double _E;
 
+  /*! @brief Midpoint of the cell (vector, [L]). */
   double _midpoint[3];
 
+  /*! @brief Acceleration (vector, [L] [T]^-2). */
   double _a[3];
-
-  omp_lock_t _lock;
-
-  Cell() { omp_init_lock(&_lock); }
-
-  ~Cell() { omp_destroy_lock(&_lock); }
-
-  void lock() { omp_set_lock(&_lock); }
-
-  void unlock() { omp_unset_lock(&_lock); }
 };
 
+/**
+ * @brief Initialize the primitive variables for the given cell.
+ *
+ * @param cell Cell to initialize.
+ */
 void init(Cell &cell) {
-  //  cell._rho = 9.64028/400.;
-  //  cell._rho = 1.24916e-02;
-  if (cell._midpoint[0] < 0.5) {
+#if PROBLEM == PROBLEM_SOD_SHOCK
+  if (cell._midpoint[0] < XMIN + 0.5 * BOXSIZE_X) {
     cell._rho = 1.;
     cell._P = 1.;
   } else {
@@ -139,13 +537,33 @@ void init(Cell &cell) {
   cell._a[0] = 0.;
   cell._a[1] = 0.;
   cell._a[2] = 0.;
+#elif PROBLEM == PROBLEM_DISC_PATCH
+  cell._rho = 9.64028 / 400.;
+  cell._u[0] = 0.;
+  cell._u[1] = 0.;
+  cell._u[2] = 0.;
+  cell._a[0] = 0.;
+  cell._a[1] = 0.;
+  cell._a[2] = 0.;
+#else
+#error "No problem chosen!"
+#endif
 }
 
+/**
+ * @brief Main program.
+ *
+ * @param argc Number of command line arguments passed on to the program.
+ * @param argv Command line arguments passed on to the program.
+ * @return Exit code: 0 on success.
+ */
 int main(int argc, char **argv) {
+// for reference: print out the isothermal sound speed (if we use it).
 #if EOS == EOS_ISOTHERMAL
   std::cout << "ISOTHERMAL_C: " << ISOTHERMAL_C << std::endl;
 #endif
 
+  // get and print the number of shared memory threads that will be used
   int num_threads = 0;
 #pragma omp parallel
   {
@@ -155,30 +573,29 @@ int main(int argc, char **argv) {
 
   std::cout << "Using " << num_threads << " threads." << std::endl;
 
+  // state the timer that will time our total program execution time
   Timer timer;
   timer.start();
 
+  // initialize the cells
+  // this allocates a huge chunk of memory
   std::vector< std::vector< std::vector< Cell > > > cells(
       NCELL_X + 2, std::vector< std::vector< Cell > >(
                        NCELL_Y + 2, std::vector< Cell >(NCELL_Z + 2)));
 
-#pragma omp parallel for default(shared)
-  for (unsigned int ix = 0; ix < NCELL_X + 2; ++ix) {
-    for (unsigned int iy = 0; iy < NCELL_Y + 2; ++iy) {
-      for (unsigned int iz = 0; iz < NCELL_Z + 2; ++iz) {
-        Cell &cell = cells[ix][iy][iz];
-        cell._midpoint[0] = XMIN + (ix - 0.5) * CELLSIZE_X;
-        cell._midpoint[1] = YMIN + (iy - 0.5) * CELLSIZE_Y;
-        cell._midpoint[2] = ZMIN + (iz - 0.5) * CELLSIZE_Z;
-      }
-    }
-  }
-
-#pragma omp parallel for default(shared)
+// initialize the cells:
+// compute the cell positions, set the primitive variables, and convert them
+// to conserved variables
+#pragma omp parallel for default(shared) collapse(3)
   for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
     for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
       for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
         Cell &cell = cells[ix][iy][iz];
+
+        cell._midpoint[0] = XMIN + (ix - 0.5) * CELLSIZE_X;
+        cell._midpoint[1] = YMIN + (iy - 0.5) * CELLSIZE_Y;
+        cell._midpoint[2] = ZMIN + (iz - 0.5) * CELLSIZE_Z;
+
         init(cell);
 
 #if EOS == EOS_ISOTHERMAL
@@ -189,82 +606,54 @@ int main(int argc, char **argv) {
         cell._p[0] = cell._m * cell._u[0];
         cell._p[1] = cell._m * cell._u[1];
         cell._p[2] = cell._m * cell._u[2];
-        cell._E = cell._P * CELL_VOLUME / (GAMMA - 1.) +
+        cell._E = cell._P * CELL_VOLUME * ONE_OVER_GAMMA_MINUS_ONE +
                   0.5 * (cell._u[0] * cell._p[0] + cell._u[1] * cell._p[1] +
                          cell._u[2] * cell._p[2]);
       }
     }
   }
 
-  RiemannSolver solver(GAMMA);
+  // allocate the Riemann solver
+  const RiemannSolver solver(GAMMA);
 
+  // main time integration loop
   for (unsigned int istep = 0; istep < NSTEP; ++istep) {
 
 #if POTENTIAL == POTENTIAL_DISC
-    for (unsigned int i = 0; i < NCELL_TOTAL; ++i) {
-      double reduction_factor = 1.;
-      if (istep * DT < 5. * 48.) {
-        reduction_factor = istep * DT / 5. / 48.;
-      }
-      double a = reduction_factor * 2. * M_PI * 10. *
-                 std::tanh(cells[i]._midpoint[0] * 0.01);
-      a *= G;
-      cells[i]._a[0] = a;
-      cells[i]._p[0] -= 0.5 * DT * a * cells[i]._m;
-    }
-#elif POTENTIAL == POTENTIAL_DISC_SUP
-    for (unsigned int i = 0; i < NCELL_TOTAL; ++i) {
-      double reduction_factor = 1.;
-      if (istep * DT < DISC_SUP_GROWTH_TIME) {
-        reduction_factor = istep * DT / DISC_SUP_GROWTH_TIME;
-      }
-      double a;
-      if (cells[i]._midpoint[0] > -300. && cells[i]._midpoint[0] < 300.) {
-        a = 2. * M_PI * 10. * std::tanh(cells[i]._midpoint[0] * 0.01);
-      } else if (cells[i]._midpoint[0] > -350. &&
-                 cells[i]._midpoint[0] < 350.) {
-        a = 2. * M_PI * 10. * std::tanh(cells[i]._midpoint[0] * 0.01) *
-            (0.5 +
-             0.5 * std::cos(M_PI * (std::abs(cells[i]._midpoint[0]) - 300.) *
-                            0.02));
-      } else {
-        a = 0.;
-      }
-      a *= reduction_factor * G;
-      cells[i]._a[0] = a;
-      cells[i]._p[0] -= 0.5 * DT * a * cells[i]._m;
+    // initialize variables used by the potential this time step
+    double reduction_factor = 1.;
+    if (istep * DT < 5. * 48.) {
+      reduction_factor = istep * DT / 5. / 48.;
     }
 #endif
 
-#pragma omp parallel for default(shared)
+// apply the gravitational potential and convert the conserved variables to
+// primitive variables
+#pragma omp parallel for default(shared) collapse(3)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
         for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
           Cell &cell = cells[ix][iy][iz];
-          cell._rho = cell._m * CELL_VOLUME_INV;
-          const double minv = 1. / cell._m;
-          cell._u[0] = cell._p[0] * minv;
-          cell._u[1] = cell._p[1] * minv;
-          cell._u[2] = cell._p[2] * minv;
-#if EOS == EOS_IDEAL
-          cell._P =
-              (GAMMA - 1.) * (cell._E * CELL_VOLUME_INV -
-                              0.5 * cell._rho * (cell._u[0] * cell._u[0] +
-                                                 cell._u[1] * cell._u[1] +
-                                                 cell._u[2] * cell._u[2]));
-#elif EOS == EOS_ISOTHERMAL
-          cell._P = ISOTHERMAL_C * cell._rho;
-#else
-#error "No equation of state selected!"
+
+#if POTENTIAL == POTENTIAL_DISC
+          double a = reduction_factor * 2. * M_PI * 10. *
+                     std::tanh(cell._midpoint[0] * 0.01);
+          a *= G;
+          cell._a[0] = a;
+          cell._p[0] -= 0.5 * DT * a * cell._m;
 #endif
+
+          compute_primitive_variables(cell._rho, cell._u, cell._P, cell._m,
+                                      cell._p, cell._E);
         }
       }
     }
 
+    // check if we need to output a snapshot file
     if (istep % SNAPSTEP == 0) {
       std::cout << "step " << istep << " of " << NSTEP << std::endl;
       std::stringstream filename;
-      filename << "snap_";
+      filename << SNAP_PREFIX;
       filename.fill('0');
       filename.width(3);
       filename << (istep / SNAPSTEP);
@@ -285,818 +674,265 @@ int main(int argc, char **argv) {
       ofile.close();
     }
 
-#if BOUNDARIES == BOUNDARIES_PERIODIC
-#pragma omp parallel for default(shared)
+// the primitive variables were updated, so we need to set new values in our
+// boundary ghost cells
+// x direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
       for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
-        cells[0][iy][iz]._rho = cells[NCELL_X][iy][iz]._rho;
-        cells[0][iy][iz]._u[0] = cells[NCELL_X][iy][iz]._u[0];
-        cells[0][iy][iz]._u[1] = cells[NCELL_X][iy][iz]._u[1];
-        cells[0][iy][iz]._u[2] = cells[NCELL_X][iy][iz]._u[2];
-        cells[0][iy][iz]._P = cells[NCELL_X][iy][iz]._P;
-        cells[NCELL_X + 1][iy][iz]._rho = cells[1][iy][iz]._rho;
-        cells[NCELL_X + 1][iy][iz]._u[0] = cells[1][iy][iz]._u[0];
-        cells[NCELL_X + 1][iy][iz]._u[1] = cells[1][iy][iz]._u[1];
-        cells[NCELL_X + 1][iy][iz]._u[2] = cells[1][iy][iz]._u[2];
-        cells[NCELL_X + 1][iy][iz]._P = cells[1][iy][iz]._P;
+        Cell &low_ghost = cells[0][iy][iz];
+        Cell &high_ghost = cells[NCELL_X + 1][iy][iz];
+        const Cell &low_real = cells[1][iy][iz];
+        const Cell &high_real = cells[NCELL_X][iy][iz];
+
+#if BOUNDARIES_X == BOUNDARIES_PERIODIC
+        copy_primitives(high_real, low_ghost);
+        copy_primitives(low_real, high_ghost);
+#elif BOUNDARIES_X == BOUNDARIES_OPEN
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+#elif BOUNDARIES_X == BOUNDARIES_REFLECTIVE
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+        low_ghost._u[0] = -low_ghost._u[0];
+        high_ghost._u[0] = -high_ghost._u[0];
+#else
+#error "Unknown boundary conditions chosen in the x direction!"
+#endif
       }
     }
-#pragma omp parallel for default(shared)
+// y direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
-        cells[ix][0][iz]._rho = cells[ix][NCELL_Y][iz]._rho;
-        cells[ix][0][iz]._u[0] = cells[ix][NCELL_Y][iz]._u[0];
-        cells[ix][0][iz]._u[1] = cells[ix][NCELL_Y][iz]._u[1];
-        cells[ix][0][iz]._u[2] = cells[ix][NCELL_Y][iz]._u[2];
-        cells[ix][0][iz]._P = cells[ix][NCELL_Y][iz]._P;
-        cells[ix][NCELL_Y + 1][iz]._rho = cells[ix][1][iz]._rho;
-        cells[ix][NCELL_Y + 1][iz]._u[0] = cells[ix][1][iz]._u[0];
-        cells[ix][NCELL_Y + 1][iz]._u[1] = cells[ix][1][iz]._u[1];
-        cells[ix][NCELL_Y + 1][iz]._u[2] = cells[ix][1][iz]._u[2];
-        cells[ix][NCELL_Y + 1][iz]._P = cells[ix][1][iz]._P;
+        Cell &low_ghost = cells[ix][0][iz];
+        Cell &high_ghost = cells[ix][NCELL_Y + 1][iz];
+        const Cell &low_real = cells[ix][1][iz];
+        const Cell &high_real = cells[ix][NCELL_Y][iz];
+
+#if BOUNDARIES_Y == BOUNDARIES_PERIODIC
+        copy_primitives(high_real, low_ghost);
+        copy_primitives(low_real, high_ghost);
+#elif BOUNDARIES_Y == BOUNDARIES_OPEN
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+#elif BOUNDARIES_Y == BOUNDARIES_REFLECTIVE
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+        low_ghost._u[1] = -low_ghost._u[1];
+        high_ghost._u[1] = -high_ghost._u[1];
+#else
+#error "Unknown boundary conditions chosen in the y direction!"
+#endif
       }
     }
-#pragma omp parallel for default(shared)
+// z direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
-        cells[ix][iy][0]._rho = cells[ix][iy][NCELL_Z]._rho;
-        cells[ix][iy][0]._u[0] = cells[ix][iy][NCELL_Z]._u[0];
-        cells[ix][iy][0]._u[1] = cells[ix][iy][NCELL_Z]._u[1];
-        cells[ix][iy][0]._u[2] = cells[ix][iy][NCELL_Z]._u[2];
-        cells[ix][iy][0]._P = cells[ix][iy][NCELL_Z]._P;
-        cells[ix][iy][NCELL_Z + 1]._rho = cells[ix][iy][1]._rho;
-        cells[ix][iy][NCELL_Z + 1]._u[0] = cells[ix][iy][1]._u[0];
-        cells[ix][iy][NCELL_Z + 1]._u[1] = cells[ix][iy][1]._u[1];
-        cells[ix][iy][NCELL_Z + 1]._u[2] = cells[ix][iy][1]._u[2];
-        cells[ix][iy][NCELL_Z + 1]._P = cells[ix][iy][1]._P;
+        Cell &low_ghost = cells[ix][iy][0];
+        Cell &high_ghost = cells[ix][iy][NCELL_Z + 1];
+        const Cell &low_real = cells[ix][iy][1];
+        const Cell &high_real = cells[ix][iy][NCELL_Z];
+
+#if BOUNDARIES_Z == BOUNDARIES_PERIODIC
+        copy_primitives(high_real, low_ghost);
+        copy_primitives(low_real, high_ghost);
+#elif BOUNDARIES_Z == BOUNDARIES_OPEN
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+#elif BOUNDARIES_Z == BOUNDARIES_REFLECTIVE
+        copy_primitives(low_real, low_ghost);
+        copy_primitives(high_real, high_ghost);
+        low_ghost._u[2] = -low_ghost._u[2];
+        high_ghost._u[2] = -high_ghost._u[2];
+#else
+#error "Unknown boundary conditions chosen in the z direction!"
+#endif
       }
     }
-#elif BOUNDARIES == BOUNDARIES_OPEN
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = cells[1]._u;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = cells[NCELL]._u;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#elif BOUNDARIES == BOUNDARIES_REFLECTIVE
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = -cells[1]._u;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = -cells[NCELL]._u;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#elif BOUNDARIES == BOUNDARIES_DISC_PATCH
-    const double coshx = std::cosh(cells[0]._midpoint * 0.01);
-    const double coshx2 = coshx * coshx;
-    cells[0]._rho = 0.05 / coshx2;
-    cells[0]._u = 0.;
-    cells[0]._P = ISOTHERMAL_C * cells[0]._rho;
-    // symmetry
-    cells[NCELL + 1]._rho = cells[0]._rho;
-    cells[NCELL + 1]._u = 0.;
-    cells[NCELL + 1]._P = cells[0]._P;
-#elif BOUNDARIES == BOUNDARIES_DISC_PATCH_SUP
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = 0.;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = 0.;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#else
-#error "No boundary conditions chosen!"
-#endif
 
-#pragma omp parallel for default(shared)
+// all cells (and neighbours) have up to date primitive variables, so we can
+// compute gradients for the primitive variables
+#pragma omp parallel for default(shared) collapse(3)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
         for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
           Cell &cell = cells[ix][iy][iz];
+          const Cell &cell_left = cells[ix - 1][iy][iz];
+          const Cell &cell_right = cells[ix + 1][iy][iz];
+          const Cell &cell_front = cells[ix][iy - 1][iz];
+          const Cell &cell_back = cells[ix][iy + 1][iz];
+          const Cell &cell_bottom = cells[ix][iy][iz - 1];
+          const Cell &cell_top = cells[ix][iy][iz + 1];
 
-          cell._grad_rho[0] =
-              0.5 * CELLSIZE_X_INV *
-              (cells[ix + 1][iy][iz]._rho - cells[ix - 1][iy][iz]._rho);
-          cell._grad_rho[1] =
-              0.5 * CELLSIZE_Y_INV *
-              (cells[ix][iy + 1][iz]._rho - cells[ix][iy - 1][iz]._rho);
-          cell._grad_rho[2] =
-              0.5 * CELLSIZE_Z_INV *
-              (cells[ix][iy][iz + 1]._rho - cells[ix][iy][iz - 1]._rho);
+          compute_gradient(cell._grad_rho, cell._rho, cell_left._rho,
+                           cell_right._rho, cell_front._rho, cell_back._rho,
+                           cell_bottom._rho, cell_top._rho);
 
-          cell._grad_u[0][0] =
-              0.5 * CELLSIZE_X_INV *
-              (cells[ix + 1][iy][iz]._u[0] - cells[ix - 1][iy][iz]._u[0]);
-          cell._grad_u[0][1] =
-              0.5 * CELLSIZE_Y_INV *
-              (cells[ix][iy + 1][iz]._u[0] - cells[ix][iy - 1][iz]._u[0]);
-          cell._grad_u[0][2] =
-              0.5 * CELLSIZE_Z_INV *
-              (cells[ix][iy][iz + 1]._u[0] - cells[ix][iy][iz - 1]._u[0]);
-          cell._grad_u[1][0] =
-              0.5 * CELLSIZE_X_INV *
-              (cells[ix + 1][iy][iz]._u[1] - cells[ix - 1][iy][iz]._u[1]);
-          cell._grad_u[1][1] =
-              0.5 * CELLSIZE_Y_INV *
-              (cells[ix][iy + 1][iz]._u[1] - cells[ix][iy - 1][iz]._u[1]);
-          cell._grad_u[1][2] =
-              0.5 * CELLSIZE_Z_INV *
-              (cells[ix][iy][iz + 1]._u[1] - cells[ix][iy][iz - 1]._u[1]);
-          cell._grad_u[2][0] =
-              0.5 * CELLSIZE_X_INV *
-              (cells[ix + 1][iy][iz]._u[2] - cells[ix - 1][iy][iz]._u[2]);
-          cell._grad_u[2][1] =
-              0.5 * CELLSIZE_Y_INV *
-              (cells[ix][iy + 1][iz]._u[2] - cells[ix][iy - 1][iz]._u[2]);
-          cell._grad_u[2][2] =
-              0.5 * CELLSIZE_Z_INV *
-              (cells[ix][iy][iz + 1]._u[2] - cells[ix][iy][iz - 1]._u[2]);
+          compute_gradient(cell._grad_u[0], cell._u[0], cell_left._u[0],
+                           cell_right._u[0], cell_front._u[0], cell_back._u[0],
+                           cell_bottom._u[0], cell_top._u[0]);
 
-          cell._grad_P[0] = 0.5 * CELLSIZE_X_INV * (cells[ix + 1][iy][iz]._P -
-                                                    cells[ix - 1][iy][iz]._P);
-          cell._grad_P[1] = 0.5 * CELLSIZE_Y_INV * (cells[ix][iy + 1][iz]._P -
-                                                    cells[ix][iy - 1][iz]._P);
-          cell._grad_P[2] = 0.5 * CELLSIZE_Z_INV * (cells[ix][iy][iz + 1]._P -
-                                                    cells[ix][iy][iz - 1]._P);
+          compute_gradient(cell._grad_u[1], cell._u[1], cell_left._u[1],
+                           cell_right._u[1], cell_front._u[1], cell_back._u[1],
+                           cell_bottom._u[1], cell_top._u[1]);
 
-          double alpha, phi_ngb_max, phi_ext_max, phi_ngb_min, phi_ext_min;
-          {
-            // density
-            phi_ngb_max = std::max(cells[ix - 1][iy][iz]._rho,
-                                   cells[ix + 1][iy][iz]._rho);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy - 1][iz]._rho);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy + 1][iz]._rho);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz - 1]._rho);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz + 1]._rho);
-            phi_ngb_max -= cell._rho;
-            phi_ngb_min = std::min(cells[ix - 1][iy][iz]._rho,
-                                   cells[ix + 1][iy][iz]._rho);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy - 1][iz]._rho);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy + 1][iz]._rho);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz - 1]._rho);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz + 1]._rho);
-            phi_ngb_min -= cell._rho;
-            phi_ext_max = 0.5 * CELLSIZE_X *
-                          std::max(cell._grad_rho[0], -cell._grad_rho[0]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Y * cell._grad_rho[1]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Y * cell._grad_rho[1]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Z * cell._grad_rho[2]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Z * cell._grad_rho[2]);
-            phi_ext_min = 0.5 * CELLSIZE_X *
-                          std::min(cell._grad_rho[0], -cell._grad_rho[0]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Y * cell._grad_rho[1]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Y * cell._grad_rho[1]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Z * cell._grad_rho[2]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Z * cell._grad_rho[2]);
+          compute_gradient(cell._grad_u[2], cell._u[2], cell_left._u[2],
+                           cell_right._u[2], cell_front._u[2], cell_back._u[2],
+                           cell_bottom._u[2], cell_top._u[2]);
 
-            alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,
-                                                 phi_ngb_min / phi_ext_min));
-            cell._grad_rho[0] *= alpha;
-            cell._grad_rho[1] *= alpha;
-            cell._grad_rho[2] *= alpha;
-          }
-          {
-            // velocity x
-            phi_ngb_max = std::max(cells[ix - 1][iy][iz]._u[0],
-                                   cells[ix + 1][iy][iz]._u[0]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy - 1][iz]._u[0]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy + 1][iz]._u[0]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz - 1]._u[0]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz + 1]._u[0]);
-            phi_ngb_max -= cell._u[0];
-            phi_ngb_min = std::min(cells[ix - 1][iy][iz]._u[0],
-                                   cells[ix + 1][iy][iz]._u[0]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy - 1][iz]._u[0]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy + 1][iz]._u[0]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz - 1]._u[0]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz + 1]._u[0]);
-            phi_ngb_min -= cell._u[0];
-            phi_ext_max = 0.5 * CELLSIZE_X *
-                          std::max(cell._grad_u[0][0], -cell._grad_u[0][0]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Y * cell._grad_u[0][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Y * cell._grad_u[0][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Z * cell._grad_u[0][2]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Z * cell._grad_u[0][2]);
-            phi_ext_min = 0.5 * CELLSIZE_X *
-                          std::min(cell._grad_u[0][0], -cell._grad_u[0][0]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Y * cell._grad_u[0][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Y * cell._grad_u[0][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Z * cell._grad_u[0][2]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Z * cell._grad_u[0][2]);
-
-            alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,
-                                                 phi_ngb_min / phi_ext_min));
-            cell._grad_u[0][0] *= alpha;
-            cell._grad_u[0][1] *= alpha;
-            cell._grad_u[0][2] *= alpha;
-          }
-          {
-            // velocity y
-            phi_ngb_max = std::max(cells[ix - 1][iy][iz]._u[1],
-                                   cells[ix + 1][iy][iz]._u[1]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy - 1][iz]._u[1]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy + 1][iz]._u[1]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz - 1]._u[1]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz + 1]._u[1]);
-            phi_ngb_max -= cell._u[1];
-            phi_ngb_min = std::min(cells[ix - 1][iy][iz]._u[1],
-                                   cells[ix + 1][iy][iz]._u[1]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy - 1][iz]._u[1]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy + 1][iz]._u[1]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz - 1]._u[1]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz + 1]._u[1]);
-            phi_ngb_min -= cell._u[1];
-            phi_ext_max = 0.5 * CELLSIZE_X *
-                          std::max(cell._grad_u[1][0], -cell._grad_u[1][0]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Y * cell._grad_u[1][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Y * cell._grad_u[1][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Z * cell._grad_u[1][2]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Z * cell._grad_u[1][2]);
-            phi_ext_min = 0.5 * CELLSIZE_X *
-                          std::min(cell._grad_u[1][0], -cell._grad_u[1][0]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Y * cell._grad_u[1][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Y * cell._grad_u[1][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Z * cell._grad_u[1][2]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Z * cell._grad_u[1][2]);
-
-            alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,
-                                                 phi_ngb_min / phi_ext_min));
-            cell._grad_u[1][0] *= alpha;
-            cell._grad_u[1][1] *= alpha;
-            cell._grad_u[1][2] *= alpha;
-          }
-          {
-            // velocity z
-            phi_ngb_max = std::max(cells[ix - 1][iy][iz]._u[2],
-                                   cells[ix + 1][iy][iz]._u[2]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy - 1][iz]._u[2]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy + 1][iz]._u[2]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz - 1]._u[2]);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz + 1]._u[2]);
-            phi_ngb_max -= cell._u[2];
-            phi_ngb_min = std::min(cells[ix - 1][iy][iz]._u[2],
-                                   cells[ix + 1][iy][iz]._u[2]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy - 1][iz]._u[2]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy + 1][iz]._u[2]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz - 1]._u[2]);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz + 1]._u[2]);
-            phi_ngb_min -= cell._u[2];
-            phi_ext_max = 0.5 * CELLSIZE_X *
-                          std::max(cell._grad_u[2][0], -cell._grad_u[2][0]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Y * cell._grad_u[2][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Y * cell._grad_u[2][1]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Z * cell._grad_u[2][2]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Z * cell._grad_u[2][2]);
-            phi_ext_min = 0.5 * CELLSIZE_X *
-                          std::min(cell._grad_u[2][0], -cell._grad_u[2][0]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Y * cell._grad_u[2][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Y * cell._grad_u[2][1]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Z * cell._grad_u[2][2]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Z * cell._grad_u[2][2]);
-
-            alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,
-                                                 phi_ngb_min / phi_ext_min));
-            cell._grad_u[2][0] *= alpha;
-            cell._grad_u[2][1] *= alpha;
-            cell._grad_u[2][2] *= alpha;
-          }
-          {
-            // pressure
-            phi_ngb_max =
-                std::max(cells[ix - 1][iy][iz]._P, cells[ix + 1][iy][iz]._P);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy - 1][iz]._P);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy + 1][iz]._P);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz - 1]._P);
-            phi_ngb_max = std::max(phi_ngb_max, cells[ix][iy][iz + 1]._P);
-            phi_ngb_max -= cell._P;
-            phi_ngb_min =
-                std::min(cells[ix - 1][iy][iz]._P, cells[ix + 1][iy][iz]._P);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy - 1][iz]._P);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy + 1][iz]._P);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz - 1]._P);
-            phi_ngb_min = std::min(phi_ngb_min, cells[ix][iy][iz + 1]._P);
-            phi_ngb_min -= cell._P;
-            phi_ext_max =
-                0.5 * CELLSIZE_X * std::max(cell._grad_P[0], -cell._grad_P[0]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Y * cell._grad_P[1]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Y * cell._grad_P[1]);
-            phi_ext_max =
-                std::max(phi_ext_max, 0.5 * CELLSIZE_Z * cell._grad_P[2]);
-            phi_ext_max =
-                std::max(phi_ext_max, -0.5 * CELLSIZE_Z * cell._grad_P[2]);
-            phi_ext_min =
-                0.5 * CELLSIZE_X * std::min(cell._grad_P[0], -cell._grad_P[0]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Y * cell._grad_P[1]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Y * cell._grad_P[1]);
-            phi_ext_min =
-                std::min(phi_ext_min, 0.5 * CELLSIZE_Z * cell._grad_P[2]);
-            phi_ext_min =
-                std::min(phi_ext_min, -0.5 * CELLSIZE_Z * cell._grad_P[2]);
-
-            alpha = std::min(1., BETA * std::min(phi_ngb_max / phi_ext_max,
-                                                 phi_ngb_min / phi_ext_min));
-            cell._grad_P[0] *= alpha;
-            cell._grad_P[1] *= alpha;
-            cell._grad_P[2] *= alpha;
-          }
+          compute_gradient(cell._grad_P, cell._P, cell_left._P, cell_right._P,
+                           cell_front._P, cell_back._P, cell_bottom._P,
+                           cell_top._P);
         }
       }
     }
 
-#if BOUNDARIES == BOUNDARIES_PERIODIC
-#pragma omp parallel for default(shared)
+// the gradients need to be updated in the boundary ghost cells
+// x direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
       for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
-        cells[0][iy][iz]._grad_rho[0] = cells[NCELL_X][iy][iz]._grad_rho[0];
-        cells[0][iy][iz]._grad_rho[1] = cells[NCELL_X][iy][iz]._grad_rho[1];
-        cells[0][iy][iz]._grad_rho[2] = cells[NCELL_X][iy][iz]._grad_rho[2];
-        cells[0][iy][iz]._grad_u[0][0] = cells[NCELL_X][iy][iz]._grad_u[0][0];
-        cells[0][iy][iz]._grad_u[0][1] = cells[NCELL_X][iy][iz]._grad_u[0][1];
-        cells[0][iy][iz]._grad_u[0][2] = cells[NCELL_X][iy][iz]._grad_u[0][2];
-        cells[0][iy][iz]._grad_u[1][0] = cells[NCELL_X][iy][iz]._grad_u[1][0];
-        cells[0][iy][iz]._grad_u[1][1] = cells[NCELL_X][iy][iz]._grad_u[1][1];
-        cells[0][iy][iz]._grad_u[1][2] = cells[NCELL_X][iy][iz]._grad_u[1][2];
-        cells[0][iy][iz]._grad_u[2][0] = cells[NCELL_X][iy][iz]._grad_u[2][0];
-        cells[0][iy][iz]._grad_u[2][1] = cells[NCELL_X][iy][iz]._grad_u[2][1];
-        cells[0][iy][iz]._grad_u[2][2] = cells[NCELL_X][iy][iz]._grad_u[2][2];
-        cells[0][iy][iz]._grad_P[0] = cells[NCELL_X][iy][iz]._grad_P[0];
-        cells[0][iy][iz]._grad_P[1] = cells[NCELL_X][iy][iz]._grad_P[1];
-        cells[0][iy][iz]._grad_P[2] = cells[NCELL_X][iy][iz]._grad_P[2];
-        cells[NCELL_X + 1][iy][iz]._grad_rho[0] = cells[1][iy][iz]._grad_rho[0];
-        cells[NCELL_X + 1][iy][iz]._grad_rho[1] = cells[1][iy][iz]._grad_rho[1];
-        cells[NCELL_X + 1][iy][iz]._grad_rho[2] = cells[1][iy][iz]._grad_rho[2];
-        cells[NCELL_X + 1][iy][iz]._grad_u[0][0] =
-            cells[1][iy][iz]._grad_u[0][0];
-        cells[NCELL_X + 1][iy][iz]._grad_u[0][1] =
-            cells[1][iy][iz]._grad_u[0][1];
-        cells[NCELL_X + 1][iy][iz]._grad_u[0][2] =
-            cells[1][iy][iz]._grad_u[0][2];
-        cells[NCELL_X + 1][iy][iz]._grad_u[1][0] =
-            cells[1][iy][iz]._grad_u[1][0];
-        cells[NCELL_X + 1][iy][iz]._grad_u[1][1] =
-            cells[1][iy][iz]._grad_u[1][1];
-        cells[NCELL_X + 1][iy][iz]._grad_u[1][2] =
-            cells[1][iy][iz]._grad_u[1][2];
-        cells[NCELL_X + 1][iy][iz]._grad_u[2][0] =
-            cells[1][iy][iz]._grad_u[2][0];
-        cells[NCELL_X + 1][iy][iz]._grad_u[2][1] =
-            cells[1][iy][iz]._grad_u[2][1];
-        cells[NCELL_X + 1][iy][iz]._grad_u[2][2] =
-            cells[1][iy][iz]._grad_u[2][2];
-        cells[NCELL_X + 1][iy][iz]._grad_P[0] = cells[1][iy][iz]._grad_P[0];
-        cells[NCELL_X + 1][iy][iz]._grad_P[1] = cells[1][iy][iz]._grad_P[1];
-        cells[NCELL_X + 1][iy][iz]._grad_P[2] = cells[1][iy][iz]._grad_P[2];
+        Cell &low_ghost = cells[0][iy][iz];
+        Cell &high_ghost = cells[NCELL_X + 1][iy][iz];
+        const Cell &low_real = cells[1][iy][iz];
+        const Cell &high_real = cells[NCELL_X][iy][iz];
+
+#if BOUNDARIES_X == BOUNDARIES_PERIODIC
+        copy_gradients(high_real, low_ghost);
+        copy_gradients(low_real, high_ghost);
+#elif BOUNDARIES_X == BOUNDARIES_OPEN
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+#elif BOUNDARIES_X == BOUNDARIES_REFLECTIVE
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+// need to add some magic
+#else
+#error "Unknown boundary conditions chosen in the x direction!"
+#endif
       }
     }
-#pragma omp parallel for default(shared)
+// y direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
-        cells[ix][0][iz]._grad_rho[0] = cells[ix][NCELL_Y][iz]._grad_rho[0];
-        cells[ix][0][iz]._grad_rho[1] = cells[ix][NCELL_Y][iz]._grad_rho[1];
-        cells[ix][0][iz]._grad_rho[2] = cells[ix][NCELL_Y][iz]._grad_rho[2];
-        cells[ix][0][iz]._grad_u[0][0] = cells[ix][NCELL_Y][iz]._grad_u[0][0];
-        cells[ix][0][iz]._grad_u[0][1] = cells[ix][NCELL_Y][iz]._grad_u[0][1];
-        cells[ix][0][iz]._grad_u[0][2] = cells[ix][NCELL_Y][iz]._grad_u[0][2];
-        cells[ix][0][iz]._grad_u[1][0] = cells[ix][NCELL_Y][iz]._grad_u[1][0];
-        cells[ix][0][iz]._grad_u[1][1] = cells[ix][NCELL_Y][iz]._grad_u[1][1];
-        cells[ix][0][iz]._grad_u[1][2] = cells[ix][NCELL_Y][iz]._grad_u[1][2];
-        cells[ix][0][iz]._grad_u[2][0] = cells[ix][NCELL_Y][iz]._grad_u[2][0];
-        cells[ix][0][iz]._grad_u[2][1] = cells[ix][NCELL_Y][iz]._grad_u[2][1];
-        cells[ix][0][iz]._grad_u[2][2] = cells[ix][NCELL_Y][iz]._grad_u[2][2];
-        cells[ix][0][iz]._grad_P[0] = cells[ix][NCELL_Y][iz]._grad_P[0];
-        cells[ix][0][iz]._grad_P[1] = cells[ix][NCELL_Y][iz]._grad_P[1];
-        cells[ix][0][iz]._grad_P[2] = cells[ix][NCELL_Y][iz]._grad_P[2];
-        cells[ix][NCELL_Y + 1][iz]._grad_rho[0] = cells[ix][1][iz]._grad_rho[0];
-        cells[ix][NCELL_Y + 1][iz]._grad_rho[1] = cells[ix][1][iz]._grad_rho[1];
-        cells[ix][NCELL_Y + 1][iz]._grad_rho[2] = cells[ix][1][iz]._grad_rho[2];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[0][0] =
-            cells[ix][1][iz]._grad_u[0][0];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[0][1] =
-            cells[ix][1][iz]._grad_u[0][1];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[0][2] =
-            cells[ix][1][iz]._grad_u[0][2];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[1][0] =
-            cells[ix][1][iz]._grad_u[1][0];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[1][1] =
-            cells[ix][1][iz]._grad_u[1][1];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[1][2] =
-            cells[ix][1][iz]._grad_u[1][2];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[2][0] =
-            cells[ix][1][iz]._grad_u[2][0];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[2][1] =
-            cells[ix][1][iz]._grad_u[2][1];
-        cells[ix][NCELL_Y + 1][iz]._grad_u[2][2] =
-            cells[ix][1][iz]._grad_u[2][2];
-        cells[ix][NCELL_Y + 1][iz]._grad_P[0] = cells[ix][1][iz]._grad_P[0];
-        cells[ix][NCELL_Y + 1][iz]._grad_P[1] = cells[ix][1][iz]._grad_P[1];
-        cells[ix][NCELL_Y + 1][iz]._grad_P[2] = cells[ix][1][iz]._grad_P[2];
+        Cell &low_ghost = cells[ix][0][iz];
+        Cell &high_ghost = cells[ix][NCELL_Y + 1][iz];
+        const Cell &low_real = cells[ix][1][iz];
+        const Cell &high_real = cells[ix][NCELL_Y][iz];
+
+#if BOUNDARIES_Y == BOUNDARIES_PERIODIC
+        copy_gradients(high_real, low_ghost);
+        copy_gradients(low_real, high_ghost);
+#elif BOUNDARIES_Y == BOUNDARIES_OPEN
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+#elif BOUNDARIES_Y == BOUNDARIES_REFLECTIVE
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+// need to add some magic
+#else
+#error "Unknown boundary conditions chosen in the y direction!"
+#endif
       }
     }
-#pragma omp parallel for default(shared)
+// z direction
+#pragma omp parallel for default(shared) collapse(2)
     for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
       for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
-        cells[ix][iy][0]._grad_rho[0] = cells[ix][iy][NCELL_Z]._grad_rho[0];
-        cells[ix][iy][0]._grad_rho[1] = cells[ix][iy][NCELL_Z]._grad_rho[1];
-        cells[ix][iy][0]._grad_rho[2] = cells[ix][iy][NCELL_Z]._grad_rho[2];
-        cells[ix][iy][0]._grad_u[0][0] = cells[ix][iy][NCELL_Z]._grad_u[0][0];
-        cells[ix][iy][0]._grad_u[0][1] = cells[ix][iy][NCELL_Z]._grad_u[0][1];
-        cells[ix][iy][0]._grad_u[0][2] = cells[ix][iy][NCELL_Z]._grad_u[0][2];
-        cells[ix][iy][0]._grad_u[1][0] = cells[ix][iy][NCELL_Z]._grad_u[1][0];
-        cells[ix][iy][0]._grad_u[1][1] = cells[ix][iy][NCELL_Z]._grad_u[1][1];
-        cells[ix][iy][0]._grad_u[1][2] = cells[ix][iy][NCELL_Z]._grad_u[1][2];
-        cells[ix][iy][0]._grad_u[2][0] = cells[ix][iy][NCELL_Z]._grad_u[2][0];
-        cells[ix][iy][0]._grad_u[2][1] = cells[ix][iy][NCELL_Z]._grad_u[2][1];
-        cells[ix][iy][0]._grad_u[2][2] = cells[ix][iy][NCELL_Z]._grad_u[2][2];
-        cells[ix][iy][0]._grad_P[0] = cells[ix][iy][NCELL_Z]._grad_P[0];
-        cells[ix][iy][0]._grad_P[1] = cells[ix][iy][NCELL_Z]._grad_P[1];
-        cells[ix][iy][0]._grad_P[2] = cells[ix][iy][NCELL_Z]._grad_P[2];
-        cells[ix][iy][NCELL_Z + 1]._grad_rho[0] = cells[ix][iy][1]._grad_rho[0];
-        cells[ix][iy][NCELL_Z + 1]._grad_rho[1] = cells[ix][iy][1]._grad_rho[1];
-        cells[ix][iy][NCELL_Z + 1]._grad_rho[2] = cells[ix][iy][1]._grad_rho[2];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[0][0] =
-            cells[ix][iy][1]._grad_u[0][0];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[0][1] =
-            cells[ix][iy][1]._grad_u[0][1];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[0][2] =
-            cells[ix][iy][1]._grad_u[0][2];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[1][0] =
-            cells[ix][iy][1]._grad_u[1][0];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[1][1] =
-            cells[ix][iy][1]._grad_u[1][1];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[1][2] =
-            cells[ix][iy][1]._grad_u[1][2];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[2][0] =
-            cells[ix][iy][1]._grad_u[2][0];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[2][1] =
-            cells[ix][iy][1]._grad_u[2][1];
-        cells[ix][iy][NCELL_Z + 1]._grad_u[2][2] =
-            cells[ix][iy][1]._grad_u[2][2];
-        cells[ix][iy][NCELL_Z + 1]._grad_P[0] = cells[ix][iy][1]._grad_P[0];
-        cells[ix][iy][NCELL_Z + 1]._grad_P[1] = cells[ix][iy][1]._grad_P[1];
-        cells[ix][iy][NCELL_Z + 1]._grad_P[2] = cells[ix][iy][1]._grad_P[2];
+        Cell &low_ghost = cells[ix][iy][0];
+        Cell &high_ghost = cells[ix][iy][NCELL_Z + 1];
+        const Cell &low_real = cells[ix][iy][1];
+        const Cell &high_real = cells[ix][iy][NCELL_Z];
+
+#if BOUNDARIES_Z == BOUNDARIES_PERIODIC
+        copy_gradients(high_real, low_ghost);
+        copy_gradients(low_real, high_ghost);
+#elif BOUNDARIES_Z == BOUNDARIES_OPEN
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+#elif BOUNDARIES_Z == BOUNDARIES_REFLECTIVE
+        copy_gradients(low_real, low_ghost);
+        copy_gradients(high_real, high_ghost);
+// need to add some magic
+#else
+#error "Unknown boundary conditions chosen in the z direction!"
+#endif
       }
     }
-#elif BOUNDARIES == BOUNDARIES_OPEN
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = cells[1]._u;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = cells[NCELL]._u;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#elif BOUNDARIES == BOUNDARIES_REFLECTIVE
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = -cells[1]._u;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = -cells[NCELL]._u;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#elif BOUNDARIES == BOUNDARIES_DISC_PATCH
-    const double coshx = std::cosh(cells[0]._midpoint * 0.01);
-    const double coshx2 = coshx * coshx;
-    cells[0]._rho = 0.05 / coshx2;
-    cells[0]._u = 0.;
-    cells[0]._P = ISOTHERMAL_C * cells[0]._rho;
-    // symmetry
-    cells[NCELL + 1]._rho = cells[0]._rho;
-    cells[NCELL + 1]._u = 0.;
-    cells[NCELL + 1]._P = cells[0]._P;
-#elif BOUNDARIES == BOUNDARIES_DISC_PATCH_SUP
-    cells[0]._rho = cells[1]._rho;
-    cells[0]._u = 0.;
-    cells[0]._P = cells[1]._P;
-    cells[NCELL + 1]._rho = cells[NCELL]._rho;
-    cells[NCELL + 1]._u = 0.;
-    cells[NCELL + 1]._P = cells[NCELL]._P;
-#else
-#error "No boundary conditions chosen!"
-#endif
 
-#pragma omp parallel for default(shared)
+// predict the primitive variables forward in time for half a time step
+#pragma omp parallel for default(shared) collapse(3)
     for (unsigned int ix = 0; ix < NCELL_X + 2; ++ix) {
       for (unsigned int iy = 0; iy < NCELL_Y + 2; ++iy) {
         for (unsigned int iz = 0; iz < NCELL_Z + 2; ++iz) {
           Cell &cell = cells[ix][iy][iz];
 
-          double rho, u[3], P, rho_inv;
-          double grho[3], gP[3], div_u;
-
-          rho = cell._rho;
-          u[0] = cell._u[0];
-          u[1] = cell._u[1];
-          u[2] = cell._u[2];
-          P = cell._P;
-          grho[0] = cell._grad_rho[0];
-          grho[1] = cell._grad_rho[1];
-          grho[2] = cell._grad_rho[2];
-          gP[0] = cell._grad_P[0];
-          gP[1] = cell._grad_P[1];
-          gP[2] = cell._grad_P[2];
-
-          rho_inv = 1. / rho;
-          div_u = cell._grad_u[0][0] + cell._grad_u[1][1] + cell._grad_u[2][2];
-
-          cell._rho -= 0.5 * DT * (rho * div_u + u[0] * grho[0] +
-                                   u[1] * grho[1] + u[2] * grho[2]);
-          cell._u[0] -= 0.5 * DT * (u[0] * div_u + rho_inv * gP[0]);
-          cell._u[1] -= 0.5 * DT * (u[1] * div_u + rho_inv * gP[1]);
-          cell._u[2] -= 0.5 * DT * (u[2] * div_u + rho_inv * gP[2]);
-          cell._P -= 0.5 * DT * (GAMMA * P * div_u + u[0] * gP[0] +
-                                 u[1] * gP[1] + u[2] * gP[2]);
+          do_half_step_prediction(cell._rho, cell._u, cell._P, cell._grad_rho,
+                                  cell._grad_u, cell._grad_P);
         }
       }
     }
 
-#pragma omp parallel for default(shared)
-    for (unsigned int ix = 0; ix < NCELL_X + 1; ++ix) {
-      for (unsigned int iy = 0; iy < NCELL_Y + 1; ++iy) {
-        for (unsigned int iz = 0; iz < NCELL_Z + 1; ++iz) {
+// now do the actual flux exchanges
+// for better parallelization, we do every pair of cells twice, with another
+// cell taking the role of active cell
+// (this also means we do not have to use locking mechanisms, which seem to
+//  cause problems combined with collapse(3))
+#pragma omp parallel for default(shared) collapse(3)
+    for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
+      for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
+        for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
 
-          Cell &lcell = cells[ix][iy][iz];
-          double rhoL, uL[3], PL, rhoR, uR[3], PR;
-          double rhoL_dash, uL_dash[3], PL_dash, rhoR_dash, uR_dash[3], PR_dash;
-          double rhosol, usol[3], Psol;
-          double mflux, pflux[3], Eflux;
-          double dm, dp[3], dE;
-          int flag;
+          // positive x direction
+          do_flux_exchange_left(cells[ix][iy][iz], cells[ix + 1][iy][iz],
+                                0.5 * CELLSIZE_X, DT_CELL_AREA_X, 0);
 
-          if (iy != 0 && iz != 0) {
-            Cell &rcell = cells[ix + 1][iy][iz];
-            // x direction
-            rhoL = lcell._rho;
-            uL[0] = lcell._u[0];
-            uL[1] = lcell._u[1];
-            uL[2] = lcell._u[2];
-            PL = lcell._P;
-            rhoR = rcell._rho;
-            uR[0] = rcell._u[0];
-            uR[1] = rcell._u[1];
-            uR[2] = rcell._u[2];
-            PR = rcell._P;
+          // negative x direction
+          do_flux_exchange_right(cells[ix][iy][iz], cells[ix - 1][iy][iz],
+                                 0.5 * CELLSIZE_X, DT_CELL_AREA_X, 0);
 
-            rhoL_dash = rhoL + 0.5 * CELLSIZE_X * lcell._grad_rho[0];
-            uL_dash[0] = uL[0] + 0.5 * CELLSIZE_X * lcell._grad_u[0][0];
-            uL_dash[1] = uL[1] + 0.5 * CELLSIZE_X * lcell._grad_u[1][0];
-            uL_dash[2] = uL[2] + 0.5 * CELLSIZE_X * lcell._grad_u[2][0];
-            PL_dash = PL + 0.5 * CELLSIZE_X * lcell._grad_P[0];
-            rhoR_dash = rhoR - 0.5 * CELLSIZE_X * rcell._grad_rho[0];
-            uR_dash[0] = uR[0] - 0.5 * CELLSIZE_X * rcell._grad_u[0][0];
-            uR_dash[1] = uR[1] - 0.5 * CELLSIZE_X * rcell._grad_u[1][0];
-            uR_dash[2] = uR[2] - 0.5 * CELLSIZE_X * rcell._grad_u[2][0];
-            PR_dash = PR - 0.5 * CELLSIZE_X * rcell._grad_P[0];
+          // positive y direction
+          do_flux_exchange_left(cells[ix][iy][iz], cells[ix][iy + 1][iz],
+                                0.5 * CELLSIZE_Y, DT_CELL_AREA_Y, 1);
 
-            flag = solver.solve(rhoL_dash, uL_dash[0], PL_dash, rhoR_dash,
-                                uR_dash[0], PR_dash, rhosol, usol[0], Psol);
-            if (flag < 0) {
-              usol[1] = uL_dash[1];
-              usol[2] = uL_dash[2];
-            } else {
-              usol[1] = uR_dash[1];
-              usol[2] = uR_dash[2];
-            }
+          // negative y direction
+          do_flux_exchange_right(cells[ix][iy][iz], cells[ix][iy - 1][iz],
+                                 0.5 * CELLSIZE_Y, DT_CELL_AREA_Y, 1);
 
-            mflux = rhosol * usol[0];
-            pflux[0] = rhosol * usol[0] * usol[0] + Psol;
-            pflux[1] = rhosol * usol[1] * usol[0];
-            pflux[2] = rhosol * usol[2] * usol[0];
-            Eflux = (Psol / (GAMMA - 1.) +
-                     0.5 * rhosol * (usol[0] * usol[0] + usol[1] * usol[1] +
-                                     usol[2] * usol[2])) *
-                        usol[0] +
-                    Psol * usol[0];
+          // positive z direction
+          do_flux_exchange_left(cells[ix][iy][iz], cells[ix][iy][iz + 1],
+                                0.5 * CELLSIZE_Z, DT_CELL_AREA_Z, 2);
 
-            dm = DT_CELL_AREA_X * mflux;
-            dp[0] = DT_CELL_AREA_X * pflux[0];
-            dp[1] = DT_CELL_AREA_X * pflux[1];
-            dp[2] = DT_CELL_AREA_X * pflux[2];
-            dE = DT_CELL_AREA_X * Eflux;
-
-            lcell.lock();
-            lcell._m -= dm;
-            lcell._p[0] -= dp[0];
-            lcell._p[1] -= dp[1];
-            lcell._p[2] -= dp[2];
-            lcell._E -= dE;
-            lcell.unlock();
-
-            rcell.lock();
-            rcell._m += dm;
-            rcell._p[0] += dp[0];
-            rcell._p[1] += dp[1];
-            rcell._p[2] += dp[2];
-            rcell._E += dE;
-            rcell.unlock();
-          }
-
-          if (ix != 0 && iz != 0) {
-            Cell &rcell = cells[ix][iy + 1][iz];
-            // y direction
-            rhoL = lcell._rho;
-            uL[0] = lcell._u[0];
-            uL[1] = lcell._u[1];
-            uL[2] = lcell._u[2];
-            PL = lcell._P;
-            rhoR = rcell._rho;
-            uR[0] = rcell._u[0];
-            uR[1] = rcell._u[1];
-            uR[2] = rcell._u[2];
-            PR = rcell._P;
-
-            rhoL_dash = rhoL + 0.5 * CELLSIZE_Y * lcell._grad_rho[1];
-            uL_dash[0] = uL[0] + 0.5 * CELLSIZE_Y * lcell._grad_u[0][1];
-            uL_dash[1] = uL[1] + 0.5 * CELLSIZE_Y * lcell._grad_u[1][1];
-            uL_dash[2] = uL[2] + 0.5 * CELLSIZE_Y * lcell._grad_u[2][1];
-            PL_dash = PL + 0.5 * CELLSIZE_Y * lcell._grad_P[1];
-            rhoR_dash = rhoR - 0.5 * CELLSIZE_Y * rcell._grad_rho[1];
-            uR_dash[0] = uR[0] - 0.5 * CELLSIZE_Y * rcell._grad_u[0][1];
-            uR_dash[1] = uR[1] - 0.5 * CELLSIZE_Y * rcell._grad_u[1][1];
-            uR_dash[2] = uR[2] - 0.5 * CELLSIZE_Y * rcell._grad_u[2][1];
-            PR_dash = PR - 0.5 * CELLSIZE_Y * rcell._grad_P[1];
-
-            flag = solver.solve(rhoL_dash, uL_dash[1], PL_dash, rhoR_dash,
-                                uR_dash[1], PR_dash, rhosol, usol[1], Psol);
-            if (flag < 0) {
-              usol[0] = uL_dash[0];
-              usol[2] = uL_dash[2];
-            } else {
-              usol[0] = uR_dash[0];
-              usol[2] = uR_dash[2];
-            }
-
-            mflux = rhosol * usol[1];
-            pflux[0] = rhosol * usol[0] * usol[1];
-            pflux[1] = rhosol * usol[1] * usol[1] + Psol;
-            pflux[2] = rhosol * usol[2] * usol[1];
-            Eflux = (Psol / (GAMMA - 1.) +
-                     0.5 * rhosol * (usol[0] * usol[0] + usol[1] * usol[1] +
-                                     usol[2] * usol[2])) *
-                        usol[1] +
-                    Psol * usol[1];
-
-            dm = DT_CELL_AREA_Y * mflux;
-            dp[0] = DT_CELL_AREA_Y * pflux[0];
-            dp[1] = DT_CELL_AREA_Y * pflux[1];
-            dp[2] = DT_CELL_AREA_Y * pflux[2];
-            dE = DT_CELL_AREA_Y * Eflux;
-
-            lcell.lock();
-            lcell._m -= dm;
-            lcell._p[0] -= dp[0];
-            lcell._p[1] -= dp[1];
-            lcell._p[2] -= dp[2];
-            lcell._E -= dE;
-            lcell.unlock();
-
-            rcell.lock();
-            rcell._m += dm;
-            rcell._p[0] += dp[0];
-            rcell._p[1] += dp[1];
-            rcell._p[2] += dp[2];
-            rcell._E += dE;
-            rcell.unlock();
-          }
-
-          if (ix != 0 && iy != 0) {
-            Cell &rcell = cells[ix][iy][iz + 1];
-            // z direction
-            rhoL = lcell._rho;
-            uL[0] = lcell._u[0];
-            uL[1] = lcell._u[1];
-            uL[2] = lcell._u[2];
-            PL = lcell._P;
-            rhoR = rcell._rho;
-            uR[0] = rcell._u[0];
-            uR[1] = rcell._u[1];
-            uR[2] = rcell._u[2];
-            PR = rcell._P;
-
-            rhoL_dash = rhoL + 0.5 * CELLSIZE_Z * lcell._grad_rho[2];
-            uL_dash[0] = uL[0] + 0.5 * CELLSIZE_Z * lcell._grad_u[0][2];
-            uL_dash[1] = uL[1] + 0.5 * CELLSIZE_Z * lcell._grad_u[1][2];
-            uL_dash[2] = uL[2] + 0.5 * CELLSIZE_Z * lcell._grad_u[2][2];
-            PL_dash = PL + 0.5 * CELLSIZE_Z * lcell._grad_P[2];
-            rhoR_dash = rhoR - 0.5 * CELLSIZE_Z * rcell._grad_rho[2];
-            uR_dash[0] = uR[0] - 0.5 * CELLSIZE_Z * rcell._grad_u[0][2];
-            uR_dash[1] = uR[1] - 0.5 * CELLSIZE_Z * rcell._grad_u[1][2];
-            uR_dash[2] = uR[2] - 0.5 * CELLSIZE_Z * rcell._grad_u[2][2];
-            PR_dash = PR - 0.5 * CELLSIZE_Z * rcell._grad_P[2];
-
-            flag = solver.solve(rhoL_dash, uL_dash[2], PL_dash, rhoR_dash,
-                                uR_dash[2], PR_dash, rhosol, usol[2], Psol);
-            if (flag < 0) {
-              usol[0] = uL_dash[0];
-              usol[1] = uL_dash[1];
-            } else {
-              usol[0] = uR_dash[0];
-              usol[1] = uR_dash[1];
-            }
-
-            mflux = rhosol * usol[2];
-            pflux[0] = rhosol * usol[0] * usol[2];
-            pflux[1] = rhosol * usol[1] * usol[2];
-            pflux[2] = rhosol * usol[2] * usol[2] + Psol;
-            Eflux = (Psol / (GAMMA - 1.) +
-                     0.5 * rhosol * (usol[0] * usol[0] + usol[1] * usol[1] +
-                                     usol[2] * usol[2])) *
-                        usol[2] +
-                    Psol * usol[2];
-
-            dm = DT_CELL_AREA_Z * mflux;
-            dp[0] = DT_CELL_AREA_Z * pflux[0];
-            dp[1] = DT_CELL_AREA_Z * pflux[1];
-            dp[2] = DT_CELL_AREA_Z * pflux[2];
-            dE = DT_CELL_AREA_Z * Eflux;
-
-            lcell.lock();
-            lcell._m -= dm;
-            lcell._p[0] -= dp[0];
-            lcell._p[1] -= dp[1];
-            lcell._p[2] -= dp[2];
-            lcell._E -= dE;
-            lcell.unlock();
-
-            rcell.lock();
-            rcell._m += dm;
-            rcell._p[0] += dp[0];
-            rcell._p[1] += dp[1];
-            rcell._p[2] += dp[2];
-            rcell._E += dE;
-            rcell.unlock();
-          }
+          // negative z direction
+          do_flux_exchange_right(cells[ix][iy][iz], cells[ix][iy][iz - 1],
+                                 0.5 * CELLSIZE_Z, DT_CELL_AREA_Z, 2);
         }
       }
     }
 
+// apply the next gravity kick
 #if POTENTIAL == POTENTIAL_DISC
-    for (unsigned int i = 0; i < NCELL_TOTAL; ++i) {
-      double reduction_factor = 1.;
-      if (istep * DT < 5. * 48.) {
-        reduction_factor = istep * DT / 5. / 48.;
+#pragma omp parallel for default(shared) collapse(3)
+    for (unsigned int ix = 1; ix < NCELL_X + 1; ++ix) {
+      for (unsigned int iy = 1; iy < NCELL_Y + 1; ++iy) {
+        for (unsigned int iz = 1; iz < NCELL_Z + 1; ++iz) {
+          Cell &cell = cells[ix][iy][iz];
+          double a = reduction_factor * 2. * M_PI * 10. *
+                     std::tanh(cell._midpoint[0] * 0.01);
+          a *= G;
+          cell._a[0] = a;
+          cell._p[0] -= 0.5 * DT * a * cell._m;
+        }
       }
-      double a = reduction_factor * 2. * M_PI * 10. *
-                 std::tanh(cells[i]._midpoint[0] * 0.01);
-      a *= G;
-      cells[i]._a[0] = a;
-      cells[i]._p[0] -= 0.5 * DT * a * cells[i]._m;
-    }
-#elif POTENTIAL == POTENTIAL_DISC_SUP
-    for (unsigned int i = 0; i < NCELL_TOTAL; ++i) {
-      double reduction_factor = 1.;
-      if (istep * DT < DISC_SUP_GROWTH_TIME) {
-        reduction_factor = istep * DT / DISC_SUP_GROWTH_TIME;
-      }
-      double a;
-      if (cells[i]._midpoint[0] > -300. && cells[i]._midpoint[0] < 300.) {
-        a = 2. * M_PI * 10. * std::tanh(cells[i]._midpoint[0] * 0.01);
-      } else if (cells[i]._midpoint[0] > -350. &&
-                 cells[i]._midpoint[0] < 350.) {
-        a = 2. * M_PI * 10. * std::tanh(cells[i]._midpoint[0] * 0.01) *
-            (0.5 +
-             0.5 * std::cos(M_PI * (std::abs(cells[i]._midpoint[0]) - 300.) *
-                            0.02));
-      } else {
-        a = 0.;
-      }
-      a *= reduction_factor * G;
-      cells[i]._a[0] = a;
-      cells[i]._p[0] -= 0.5 * DT * a * cells[i]._m;
     }
 #endif
   }
 
+  // end of the main program
+  // stop the timer and output the total execution time
   timer.stop();
   std::cout << "Total program time: " << timer.value() << " s." << std::endl;
   return 0;
