@@ -60,7 +60,10 @@
 /// customizable parameters
 
 // problem we want to solve
-#define PROBLEM PROBLEM_SOD_SHOCK
+#define PROBLEM PROBLEM_DISC_PATCH
+
+// amplitude of random velocity noise in the disc patch test
+#define NOISE_AMPLITUDE 1.e-8
 
 // number of cells in each spatial dimension
 #define NCELL_X 100
@@ -135,8 +138,8 @@
 #define ZMAX 200.
 
 #define DT 0.01
-#define NSTEP 1000000
-#define SNAPSTEP 10000
+#define NSTEP 100000
+#define SNAPSTEP 1000
 #define SNAP_PREFIX "disc_"
 
 #define POTENTIAL POTENTIAL_DISC
@@ -485,6 +488,13 @@
   }
 
 /**
+ * @brief Get a random uniform double precision number in the range [0,1].
+ *
+ * @return Random uniform double precision floating point.
+ */
+#define rand_double() ((double)rand()) / ((double)RAND_MAX)
+
+/**
  * @brief Cell.
  */
 class Cell {
@@ -540,8 +550,8 @@ void init(Cell &cell) {
 #elif PROBLEM == PROBLEM_DISC_PATCH
   cell._rho = 9.64028 / 400.;
   cell._u[0] = 0.;
-  cell._u[1] = 0.;
-  cell._u[2] = 0.;
+  cell._u[1] = NOISE_AMPLITUDE * (rand_double() - 0.5);
+  cell._u[2] = NOISE_AMPLITUDE * (rand_double() - 0.5);
   cell._a[0] = 0.;
   cell._a[1] = 0.;
   cell._a[2] = 0.;
